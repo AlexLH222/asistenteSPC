@@ -1,6 +1,7 @@
 import os
 import json
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
@@ -8,36 +9,46 @@ from typing import Dict
 import firebase_admin
 from firebase_admin import credentials, firestore
 import re
+import logging
 
 # Configuración inicial
-genai.configure(api_key=os.getenv("API_KEY"))
-modelo = genai.GenerativeModel("gemini-1.5-flash")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Inicializar Firebase para producción
-if not firebase_admin._apps:
-    # Opción 1: Usar variable de entorno con credenciales JSON
-    firebase_config = os.getenv("FIREBASE_CONFIG")
-    if firebase_config:
-        cred = credentials.Certificate(json.loads(firebase_config))
-    # Opción 2: Usar archivo (solo para desarrollo local)
-    elif os.path.exists("clave_firebase.json"):
-        cred = credentials.Certificate("clave_firebase.json")
-    else:
-        raise ValueError("No se encontró configuración para Firebase")
-    
-    firebase_admin.initialize_app(cred)
+# Configuración de Gemini AI
+try:
+    genai.configure(api_key=os.getenv("API_KEY"))
+    modelo = genai.GenerativeModel("gemini-1.5-flash")
+except Exception as e:
+    logger.error(f"Error configurando Gemini AI: {e}")
+    raise
 
-db = firestore.client()
+# Inicializar Firebase
+try:
+    if not firebase_admin._apps:
+        firebase_config = os.getenv("FIREBASE_CONFIG")
+        if firebase_config:
+            cred = credentials.Certificate(json.loads(firebase_config))
+        elif os.path.exists("clave_firebase.json"):
+            cred = credentials.Certificate("clave_firebase.json")
+        else:
+            raise ValueError("No se encontró configuración para Firebase")
+        
+        firebase_admin.initialize_app(cred)
+    db = firestore.client()
+except Exception as e:
+    logger.error(f"Error inicializando Firebase: {e}")
+    raise
 
-app = FastAPI()
+app = FastAPI(
+    title="API Coprodelito",
+    description="Asistente emocional para estudiantes",
+    version="1.0",
+    docs_url="/docs",
+    redoc_url=None
+)
 
-# Configuración CORS para producción
-origins = [
-    "https://tu-frontend.web.app",  # Reemplaza con tu dominio
-    "http://localhost",
-    "http://localhost:8080",
-]
-
+# Configuración CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,7 +57,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Variables globales (considera usar Redis en producción)
+# Variables globales (para producción considera usar Redis)
 historial_conversacion = []
 emociones_detectadas = set()
 situaciones_emocionales = []
@@ -62,24 +73,38 @@ class UserRequest(BaseModel):
     email: str
     password: str
 
-# Endpoints
-@app.post("/register")
-async def register(user: UserRequest) -> Dict:
+# Endpoint raíz mejorado
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/docs")
+
+# Endpoints de autenticación
+@app.post("/register", response_model=Dict)
+async def register(user: UserRequest):
     correo = user.email.lower().strip()
     password = user.password.strip()
 
     if not re.match(r'^[a-z]+\.[a-z]+@spc\.edu\.pe$', correo):
-        return {"success": False, "error": "El correo debe tener el formato nombre.apellido@spc.edu.pe"}
+        raise HTTPException(
+            status_code=400,
+            detail="El correo debe tener el formato nombre.apellido@spc.edu.pe"
+        )
 
     if len(password) != 8:
-        return {"success": False, "error": "La contraseña debe tener 8 caracteres."}
+        raise HTTPException(
+            status_code=400,
+            detail="La contraseña debe tener 8 caracteres."
+        )
 
     try:
         usuarios_ref = db.collection("correosEstudiantes")
         coincidencias = usuarios_ref.where("correoEstudiante", "==", correo).limit(1).get()
         
         if coincidencias:
-            return {"success": False, "error": "El correo ya está registrado."}
+            raise HTTPException(
+                status_code=400,
+                detail="El correo ya está registrado."
+            )
 
         await usuarios_ref.add({
             "correoEstudiante": correo,
@@ -87,10 +112,14 @@ async def register(user: UserRequest) -> Dict:
         })
         return {"success": True, "user_id": correo}
     except Exception as e:
-        return {"success": False, "error": f"Error en el servidor: {str(e)}"}
+        logger.error(f"Error en registro: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error en el servidor: {str(e)}"
+        )
 
-@app.post("/login")
-async def login(user: UserRequest) -> Dict:
+@app.post("/login", response_model=Dict)
+async def login(user: UserRequest):
     correo = user.email.lower().strip()
     password = user.password.strip()
 
@@ -100,29 +129,43 @@ async def login(user: UserRequest) -> Dict:
                                   .where("pswEstudiante", "==", password) \
                                   .limit(1).get()
         
-        if coincidencias:
-            return {"success": True, "user_id": correo}
-        return {"success": False, "error": "Credenciales incorrectas"}
+        if not coincidencias:
+            raise HTTPException(
+                status_code=401,
+                detail="Credenciales incorrectas"
+            )
+        return {"success": True, "user_id": correo}
     except Exception as e:
-        return {"success": False, "error": f"Error en el servidor: {str(e)}"}
+        logger.error(f"Error en login: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error en el servidor: {str(e)}"
+        )
 
-@app.post("/welcome")
+@app.post("/welcome", response_model=Dict)
 async def mensaje_bienvenida(user: UserRequest):
     global historial_conversacion, primer_mensaje, emociones_detectadas, correo_alumno, documento_emocion_id, situaciones_emocionales
     
-    nombre = user.email.split('@')[0].replace('.', ' ')
-    nombre_cap = ' '.join([p.capitalize() for p in nombre.split()])
-    mensaje = f"¡Hola {nombre_cap}! 👋 Soy Coprodelito, tu asistente emocional. ¿Cómo te sientes hoy?"
-    
-    # Reiniciar estado de conversación
-    historial_conversacion = [{"role": "assistant", "parts": [mensaje]}]
-    emociones_detectadas = set()
-    situaciones_emocionales = []
-    correo_alumno = user.email.lower().strip()
-    documento_emocion_id = None
-    primer_mensaje = None
-    
-    return {"response": mensaje}
+    try:
+        nombre = user.email.split('@')[0].replace('.', ' ')
+        nombre_cap = ' '.join([p.capitalize() for p in nombre.split()])
+        mensaje = f"¡Hola {nombre_cap}! 👋 Soy Coprodelito, tu asistente emocional. ¿Cómo te sientes hoy?"
+        
+        # Reiniciar estado de conversación
+        historial_conversacion = [{"role": "assistant", "parts": [mensaje]}]
+        emociones_detectadas = set()
+        situaciones_emocionales = []
+        correo_alumno = user.email.lower().strip()
+        documento_emocion_id = None
+        primer_mensaje = None
+        
+        return {"response": mensaje}
+    except Exception as e:
+        logger.error(f"Error en bienvenida: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Error al generar mensaje de bienvenida"
+        )
 
 # Funciones auxiliares
 def es_agradecimiento(texto: str) -> bool:
@@ -166,7 +209,8 @@ Responde de forma empática y natural, identificando emociones cuando sea nuevo 
         respuesta = await modelo.generate_content_async(prompt)
         texto = respuesta.text.strip()
 
-        # Procesamiento de emociones y guardado en Firestore
+        # Procesamiento de emociones
+        emocion_detectada = ""
         if es_cambio_tema() and not texto.lower().startswith("emoción detectada"):
             emocion_respuesta = await modelo.generate_content_async(
                 f"Identifica la emoción principal en: '{mensaje_usuario}'. Responde solo con una palabra."
@@ -184,7 +228,7 @@ Responde de forma empática y natural, identificando emociones cuando sea nuevo 
         return texto
 
     except Exception as e:
-        print(f"Error en generar_respuesta_emocional: {str(e)}")
+        logger.error(f"Error generando respuesta emocional: {e}")
         return "¡Vaya! Algo no ha ido bien. ¿Podrías intentarlo de nuevo?"
 
 async def guardar_emocion_firestore(emocion: str, mensaje: str):
@@ -210,18 +254,32 @@ async def guardar_emocion_firestore(emocion: str, mensaje: str):
                 doc_ref = await db.collection("emocionesDetectadas").add(data)
                 documento_emocion_id = doc_ref.id
     except Exception as e:
-        print(f"Error al guardar emoción: {str(e)}")
+        logger.error(f"Error guardando emoción en Firestore: {e}")
 
-@app.post("/chat")
+@app.post("/chat", response_model=Dict)
 async def chat_endpoint(chat: ChatRequest):
-    respuesta = await generar_respuesta_emocional(chat.message)
-    return {"response": respuesta}
+    try:
+        respuesta = await generar_respuesta_emocional(chat.message)
+        return {"response": respuesta}
+    except Exception as e:
+        logger.error(f"Error en endpoint /chat: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Error al procesar el mensaje"
+        )
 
-@app.get("/")
-async def root():
-    return {"message": "Backend funcionando correctamente"}
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "version": "1.0"}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 1000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        timeout_keep_alive=30
+    )
