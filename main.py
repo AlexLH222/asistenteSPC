@@ -217,11 +217,6 @@ async def chat_endpoint(chat: ChatRequest):
     respuesta = await generar_respuesta_emocional(chat.message)
     return {"response": respuesta}
 
-# Para desarrollo local
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
-
 @app.get("/")
 async def root():
     return {"message": "Backend funcionando correctamente"}
